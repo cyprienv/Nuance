@@ -178,6 +178,17 @@ button,input{font:inherit;color:inherit}
 .pctbig{font-size:2.6rem;font-weight:800}
 .ptsbig{font-size:1.3rem;color:#3ddc97;font-weight:800}
 .overlay{position:fixed;inset:0;background:#000c;backdrop-filter:blur(6px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;z-index:50;padding:24px;text-align:center}
+.vid-wrap{position:relative;flex:1;min-height:0;border-radius:18px;overflow:hidden;background:#000}
+.vid-wrap video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.vid-cross{position:absolute;left:50%;top:50%;width:38px;height:38px;border:3px solid #fff;border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 0 2px #0007,inset 0 0 0 2px #0007}
+.vid-cmp{position:absolute;left:12px;top:12px;display:flex;border-radius:12px;overflow:hidden;border:3px solid #fff;box-shadow:0 4px 14px #0008}
+.vid-cmp div{width:44px;height:44px}
+.vid-msg{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--mut)}
+.camrow{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:10px}
+.camrow .btn{padding:.8em 1em;font-size:.95rem}
+.shutter{width:78px;height:78px;border-radius:50%;border:5px solid #fff;background:var(--acc);cursor:pointer;transition:transform .1s}
+.shutter:active{transform:scale(.9)}
+.shutter:disabled{opacity:.3}
 </style>
 </head>
 <body>
@@ -293,7 +304,7 @@ const H = { peer:null, code:'', players:{}, conns:new Map(), phase:'lobby', roun
 function genCode(){ const A='ABCDEFGHJKLMNPQRSTUVWXYZ'; let s=''; for(let i=0;i<4;i++) s+=A[Math.floor(Math.random()*A.length)]; return s; }
 const joinUrl = () => location.origin + location.pathname + '?r=' + H.code;
 const playersArr = () => Object.values(H.players);
-const online = p => p.conn && p.conn.open;
+const online = p => !!(p.conn && p.conn.open && Date.now() - (p.seen||0) < 12000);
 function send(conn,msg){ try{ if(conn && conn.open) conn.send(msg); }catch(e){ console.warn(e); } }
 function broadcast(fn){ playersArr().forEach(p => { const m = typeof fn==='function' ? fn(p) : fn; if(m) send(p.conn,m); }); }
 
@@ -302,7 +313,18 @@ function startHost(){
   H.code = genCode();
   app.innerHTML = `<div class="center"><div class="spinner"></div><p class="mut">Création de la salle…</p></div>`;
   const peer = new Peer(PREFIX + H.code);
-  peer.on('open', () => { H.peer = peer; renderLobby(); });
+  peer.on('open', () => {
+    H.peer = peer; renderLobby();
+    // surveille les joueurs (déconnexions silencieuses, téléphone en veille…)
+    setInterval(() => {
+      const sig = playersArr().map(p => p.key + online(p) + !!p.sub).join('|');
+      if(sig !== H.sig){ H.sig = sig; refreshHost(); }
+      if(H.phase==='round'){
+        const act = playersArr().filter(online);
+        if(act.length && act.every(x=>x.sub) && !H.endPending){ H.endPending=true; setTimeout(()=>{ H.endPending=false; if(H.phase==='round') endRound(); }, 1300); }
+      }
+    }, 2000);
+  });
   peer.on('error', e => {
     if(e.type === 'unavailable-id'){ peer.destroy(); startHost(); return; }
     console.warn('peer error', e);
@@ -327,17 +349,30 @@ function onHostClose(conn){
 
 function onHostData(conn,d){
   if(!d || typeof d !== 'object') return;
+  const k0 = H.conns.get(conn.peer);
+  if(k0 && H.players[k0] && H.players[k0].conn === conn) H.players[k0].seen = Date.now();
+  if(d.t === 'ping'){ send(conn,{t:'pong'}); return; }
   if(d.t === 'join'){
     const name = String(d.name||'').trim().replace(/\s+/g,' ').slice(0,16) || 'Joueur';
+    const id = String(d.id||'').slice(0,40);
     const key = name.toLowerCase();
-    let p = H.players[key];
-    if(p && online(p) && p.conn !== conn){ send(conn,{t:'error',msg:'Ce prénom est déjà pris, choisis-en un autre.'}); return; }
+    // 1) même téléphone qui revient (même identifiant) → on reprend sa place
+    let p = id ? playersArr().find(x => x.id === id) : null;
+    if(!p){
+      const byName = H.players[key];
+      if(byName){
+        if(online(byName) && byName.conn !== conn){ send(conn,{t:'error',msg:'Ce prénom est déjà pris, choisis-en un autre.'}); return; }
+        p = byName; p.id = id;   // ancien joueur parti → on récupère son score
+      }
+    }
     if(!p){
       if(playersArr().length >= 12){ send(conn,{t:'error',msg:'La partie est pleine (12 joueurs max).'}); return; }
       const usedHues = playersArr().map(x=>x.hue);
-      p = H.players[key] = { key, name, score:0, last:0, sub:null, hue: AVATARS.find(c=>!usedHues.includes(c)) || AVATARS[0] };
+      p = H.players[key] = { key, id, name, score:0, last:0, sub:null, hue: AVATARS.find(c=>!usedHues.includes(c)) || AVATARS[0] };
     }
-    p.conn = conn; H.conns.set(conn.peer, key);
+    const old = p.conn;
+    p.conn = conn; p.seen = Date.now(); H.conns.set(conn.peer, p.key);
+    if(old && old !== conn){ H.conns.delete(old.peer); try{ old.close(); }catch(e){} }
     send(conn, {t:'joined', name:p.name, hue:p.hue});
     syncPlayer(p);
     if(H.phase==='lobby') beep(700,.1);
@@ -357,7 +392,7 @@ function onHostData(conn,d){
     beep(880,.08);
     refreshHost();
     const act = playersArr().filter(online);
-    if(act.length && act.every(x=>x.sub)) setTimeout(()=>{ if(H.phase==='round') endRound(); }, 1300);
+    if(act.length && act.every(x=>x.sub) && !H.endPending){ H.endPending=true; setTimeout(()=>{ H.endPending=false; if(H.phase==='round') endRound(); }, 1300); }
   }
 }
 
@@ -582,12 +617,23 @@ function renderEnd(){
 /* =========================================================
    JOUEUR (téléphone)
    ========================================================= */
-const P = { peer:null, conn:null, code:'', name:'', hue:'#fff', target:null, round:0, total:0, endsAt:0, timer:null,
-            off:null, ctx:null, pick:null, sent:false, retry:0, wake:null };
+const store = {
+  get(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } },
+  set(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+};
+const P = { peer:null, conn:null, code:'', name:'', hue:'#fff', id:'', target:null, round:0, total:0, endsAt:0, timer:null,
+            off:null, ctx:null, pick:null, sent:false, retry:0, retryT:null, want:false, joined:false, auto:false,
+            lastPong:0, stage:'', stream:null, liveT:null, wake:null };
+P.id = store.get('nuance-id') || (Math.random().toString(36).slice(2) + Date.now().toString(36));
+store.set('nuance-id', P.id);
+
+function saveSession(){ store.set('nuance-session', JSON.stringify({ code:P.code, name:P.name, t:Date.now() })); }
+function readSession(){ try{ return JSON.parse(store.get('nuance-session')||'null'); }catch(e){ return null; } }
 
 function playerJoin(code, err=''){
-  P.code = code;
-  const saved = (()=>{ try{ return localStorage.getItem('nuance-name')||''; }catch(e){ return ''; } })();
+  P.code = code; P.want = false; P.stage = '';
+  stopCamera(); hideLost();
+  const saved = store.get('nuance-name') || '';
   app.innerHTML = `<div class="p-wrap p-join">
     <div class="p-mid">
       ${logo('sm')}
@@ -605,82 +651,140 @@ function playerJoin(code, err=''){
     const name = $('#nm').value.trim(), c = $('#cd').value.trim().toUpperCase();
     if(!name){ $('#perr').textContent='Il faut un prénom !'; return; }
     if(c.length!==4){ $('#perr').textContent='Le code fait 4 lettres.'; return; }
-    P.name = name; P.code = c;
-    try{ localStorage.setItem('nuance-name',name); }catch(e){}
+    P.name = name; P.code = c; P.auto = false;
+    store.set('nuance-name', name);
+    if(location.search !== '?r='+c) history.replaceState(null,'',location.pathname+'?r='+c);
     wakeLock();
     connectPlayer();
   };
 }
 
-async function wakeLock(){ try{ if('wakeLock' in navigator) P.wake = await navigator.wakeLock.request('screen'); }catch(e){} }
-document.addEventListener('visibilitychange', () => {
-  if(document.visibilityState!=='visible' || !P.name) return;
-  wakeLock();
-  if(!P.conn || !P.conn.open) openConn();
-});
+async function wakeLock(){ try{ if('wakeLock' in navigator && document.visibilityState==='visible') P.wake = await navigator.wakeLock.request('screen'); }catch(e){} }
 
 function pWait(title, sub, emoji='🎨'){
+  P.stage = '';
   app.innerHTML = `<div class="p-wrap"><div class="p-mid"><div style="font-size:4rem">${emoji}</div><h2>${title}</h2><p class="p-hint">${sub}</p></div>
     <div class="p-hint" style="font-size:.85rem">${esc(P.name)} · partie ${esc(P.code)}</div></div>`;
 }
 
+/* ---------- connexion robuste ---------- */
 function connectPlayer(){
   if(typeof Peer === 'undefined'){ playerJoin(P.code,'Impossible de charger le jeu (connexion internet ?)'); return; }
-  pWait('Connexion…','On cherche la partie '+esc(P.code),'📡');
-  if(P.peer && !P.peer.destroyed){ openConn(); return; }
-  P.peer = new Peer();
-  P.peer.on('open', openConn);
-  P.peer.on('error', e => {
-    console.warn(e);
+  P.want = true; P.retry = 0;
+  if(!P.joined) pWait('Connexion…','On cherche la partie '+esc(P.code),'📡');
+  ensurePeer(openConn);
+}
+
+function ensurePeer(cb){
+  if(P.peer && P.peer.open && !P.peer.disconnected && !P.peer.destroyed){ cb(); return; }
+  if(P.peer){ try{ P.peer.destroy(); }catch(e){} }
+  const peer = new Peer();
+  P.peer = peer;
+  peer.on('open', () => { if(P.peer===peer) cb(); });
+  peer.on('disconnected', () => { if(P.peer===peer) scheduleRetry(); });
+  peer.on('error', e => {
+    if(P.peer!==peer) return;
+    console.warn('peer', e.type);
     if(e.type==='peer-unavailable'){
-      if(P.joined) lost(); else playerJoin(P.code,'Partie introuvable. Vérifie le code affiché sur l\'écran.');
-    } else if(!P.joined) playerJoin(P.code,'Erreur de connexion ('+e.type+'). Réessaie.');
+      if(!P.joined){
+        playerJoin(P.code, P.auto ? 'Cette partie n\'existe plus. Vérifie le code sur l\'écran.' : 'Partie introuvable. Vérifie le code affiché sur l\'écran.');
+        return;
+      }
+    }
+    scheduleRetry();
   });
-  P.peer.on('disconnected', () => { try{ P.peer.reconnect(); }catch(e){} });
 }
 
 function openConn(){
-  if(!P.peer || P.peer.destroyed || P.peer.disconnected){ if(P.peer && P.peer.disconnected){ try{P.peer.reconnect();}catch(e){} } }
-  if(!P.peer || !P.peer.open) return;
+  if(!P.want) return;
+  const prev = P.conn;
   const c = P.peer.connect(PREFIX + P.code, { reliable:true });
   P.conn = c;
-  c.on('open', () => { P.retry=0; hideLost(); c.send({ t:'join', name:P.name }); });
+  if(prev && prev!==c){ try{ prev.close(); }catch(e){} }
+  const to = setTimeout(() => { if(P.conn===c && !c.open) scheduleRetry(); }, 7000);
+  c.on('open', () => { clearTimeout(to); P.lastPong = Date.now(); c.send({ t:'join', name:P.name, id:P.id }); });
   c.on('data', onPlayerData);
-  c.on('close', () => { if(P.conn===c) lost(); });
-  c.on('error', () => { if(P.conn===c) lost(); });
+  c.on('close', () => { if(P.conn===c) scheduleRetry(); });
+  c.on('error', () => { if(P.conn===c) scheduleRetry(); });
 }
 
-function lost(){
-  if(!P.joined) return;
-  if(P.retry < 3){ P.retry++; setTimeout(openConn, 1500*P.retry); }
+function scheduleRetry(){
+  if(!P.want) return;
+  if(P.joined) showLost();
+  clearTimeout(P.retryT);
+  P.retry++;
+  if(!P.joined && P.retry > 4){ playerJoin(P.code,'Connexion impossible. Réessaie.'); return; }
+  P.retryT = setTimeout(() => {
+    if(!P.want) return;
+    if(P.peer && P.peer.disconnected && !P.peer.destroyed){ try{ P.peer.reconnect(); }catch(e){} }
+    ensurePeer(openConn);
+  }, Math.min(4000, 600*P.retry));
+}
+
+function reconnectNow(){
+  if(!P.want) return;
+  P.retry = 0;
+  ensurePeer(openConn);
+}
+
+// battement de cœur : détecte une connexion morte même si le navigateur ne l'a pas signalée
+setInterval(() => {
+  if(!P.want || document.visibilityState!=='visible') return;
+  if(P.conn && P.conn.open){
+    try{ P.conn.send({t:'ping'}); }catch(e){}
+    if(P.joined && Date.now()-P.lastPong > 12000){ P.lastPong = Date.now(); reconnectNow(); }
+  }
+}, 4000);
+
+function onWake(){
+  if(document.visibilityState!=='visible' || !P.want) return;
+  wakeLock();
+  const dead = !P.conn || !P.conn.open || !P.peer || P.peer.disconnected || P.peer.destroyed;
+  if(dead) reconnectNow();
+  else { try{ P.conn.send({t:'ping'}); }catch(e){ reconnectNow(); } }
+}
+document.addEventListener('visibilitychange', onWake);
+window.addEventListener('pageshow', onWake);
+window.addEventListener('online', onWake);
+window.addEventListener('focus', onWake);
+
+function showLost(){
   if($('#lostov')) return;
   const ov = document.createElement('div');
   ov.className='overlay'; ov.id='lostov';
-  ov.innerHTML = `<div style="font-size:3rem">📡</div><h2>Connexion perdue</h2><p class="p-hint">L'écran est peut-être fermé ou le téléphone s'est mis en veille.</p><button class="btn big" id="reco">Se reconnecter</button>`;
+  ov.innerHTML = `<div class="spinner"></div><h2>Reconnexion…</h2><p class="p-hint">Ne t'inquiète pas, ta partie est gardée.</p><button class="btn ghost" id="reco">Réessayer maintenant</button>`;
   document.body.appendChild(ov);
-  $('#reco').onclick = () => { P.retry=0; openConn(); };
+  $('#reco').onclick = reconnectNow;
 }
 function hideLost(){ const o=$('#lostov'); if(o) o.remove(); }
 
 function onPlayerData(d){
   if(!d || typeof d!=='object') return;
+  P.lastPong = Date.now();
   switch(d.t){
-    case 'error': P.joined=false; try{P.conn.close();}catch(e){} playerJoin(P.code, d.msg); break;
-    case 'joined': P.joined=true; P.name=d.name; P.hue=d.hue; break;
-    case 'lobby': setT('#ff5a36'); pWait('Tu es dans la partie !','Regarde l\'écran : la partie va bientôt commencer.','🙌'); break;
-    case 'round':
+    case 'pong': break;
+    case 'error': P.joined=false; P.want=false; try{P.conn.close();}catch(e){} playerJoin(P.code, d.msg); break;
+    case 'joined': P.joined=true; P.retry=0; P.name=d.name; P.hue=d.hue; hideLost(); saveSession(); break;
+    case 'lobby': stopCamera(); setT('#ff5a36'); pWait('Tu es dans la partie !','Regarde l\'écran : la partie va bientôt commencer.','🙌'); break;
+    case 'round': {
+      const same = d.round===P.round && P.target && P.target.hex===d.hex;
+      P.endsAt = Date.now() + d.secs*1000;
+      P.round=d.round; P.total=d.total;
+      if(same && !d.sent && P.stage){ startPTimer(); break; }   // reconnexion en pleine prise de photo : on ne touche à rien
       P.target = { name:d.name, hex:d.hex, no:d.no, rgb:hexToRgb(d.hex) };
-      P.round=d.round; P.total=d.total; P.endsAt = Date.now() + d.secs*1000;
-      P.sent = d.sent; P.pick = null; P.off = null;
+      P.sent = d.sent;
+      if(!same){ P.pick = null; P.off = null; if(navigator.vibrate) navigator.vibrate(120); }
       setT(d.hex);
-      if(navigator.vibrate) navigator.vibrate(120);
       startPTimer();
-      P.sent ? pSent() : pRound();
+      if(P.sent) pSent();
+      else if(same && P.off) pPicker();
+      else pRound();
       break;
-    case 'sent': P.sent=true; pSent(); break;
-    case 'reveal': stopPTimer(); pWait('Temps écoulé !','Tous les yeux sur l\'écran pour le reveal…','👀'); break;
-    case 'result': pResult(d); break;
-    case 'end': pEnd(d); break;
+    }
+    case 'sent': P.sent=true; stopCamera(); pSent(); break;
+    case 'reveal': stopCamera(); stopPTimer(); pWait('Temps écoulé !','Tous les yeux sur l\'écran pour le reveal…','👀'); break;
+    case 'result': stopCamera(); pResult(d); break;
+    case 'end': stopCamera(); pEnd(d); break;
   }
 }
 const setT = hex => document.documentElement.style.setProperty('--t', hex);
@@ -695,16 +799,93 @@ function startPTimer(){
 }
 function stopPTimer(){ clearInterval(P.timer); }
 const pTop = () => `<div class="p-top"><span>Manche ${P.round}/${P.total}</span><span class="p-timer" id="pt"></span></div>`;
-const camInput = id => `<input type="file" id="${id}" accept="image/*" capture="environment" hidden>`;
 
 function pRound(){
+  P.stage = '';
   const t = P.target;
   app.innerHTML = `<div class="p-wrap">${pTop()}
     <div class="p-mid">${chip(t.hex,t.name,t.no,'ph')}
       <p class="p-hint">Trouve cette couleur autour de toi<br>et prends-la en photo.</p></div>
-    <label class="btn big full acc">📸 Prendre la photo${camInput('cam')}</label></div>`;
+    <button class="btn big full acc" id="openCam">📸 Ouvrir l'appareil photo</button></div>`;
   startPTimer();
+  $('#openCam').onclick = pCamera;
+}
+
+/* ---------- appareil photo intégré à la page (on ne quitte jamais le site) ---------- */
+function stopCamera(){
+  clearInterval(P.liveT);
+  if(P.stream){ P.stream.getTracks().forEach(t=>t.stop()); P.stream = null; }
+}
+
+async function pCamera(){
+  P.stage = 'camera';
+  const t = P.target;
+  app.innerHTML = `<div class="p-wrap">${pTop()}
+    <div class="vid-wrap"><video id="vid" playsinline autoplay muted></video>
+      <div class="vid-cross"></div>
+      <div class="vid-cmp"><div style="background:${t.hex}"></div><div id="live"></div></div>
+      <div class="vid-msg" id="vmsg">Ouverture de la caméra…</div>
+    </div>
+    <p class="p-hint">Vise la couleur avec le rond, puis déclenche.<br>Tu pourras affiner la zone juste après.</p>
+    <div class="camrow"><button class="btn ghost" id="camBack">Retour</button><button class="shutter" id="shoot" aria-label="Prendre la photo" disabled></button><span></span></div>
+  </div>`;
+  startPTimer();
+  $('#camBack').onclick = () => { stopCamera(); P.off ? pPicker() : pRound(); };
+  stopCamera();
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ camFallback('Ton navigateur ne donne pas accès à la caméra.'); return; }
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({ audio:false,
+      video:{ facingMode:{ ideal:'environment' }, width:{ ideal:1920 }, height:{ ideal:1080 } } });
+    if(P.stage!=='camera'){ stream.getTracks().forEach(t=>t.stop()); return; }
+    P.stream = stream;
+    const v = $('#vid');
+    v.srcObject = stream;
+    await v.play().catch(()=>{});
+    $('#vmsg').remove();
+    $('#shoot').disabled = false;
+    $('#shoot').onclick = () => capture(v);
+    // aperçu en direct de la couleur visée
+    const tiny = document.createElement('canvas'); tiny.width = tiny.height = 8;
+    const tctx = tiny.getContext('2d', { willReadFrequently:true });
+    P.liveT = setInterval(() => {
+      if(!v.videoWidth) return;
+      const s = Math.min(v.videoWidth, v.videoHeight)*0.04;
+      tctx.drawImage(v, v.videoWidth/2-s/2, v.videoHeight/2-s/2, s, s, 0, 0, 8, 8);
+      const px = tctx.getImageData(0,0,8,8).data; let r=0,g=0,b=0;
+      for(let i=0;i<px.length;i+=4){ r+=px[i]; g+=px[i+1]; b+=px[i+2]; }
+      const el = $('#live'); if(el) el.style.background = rgbToHex([r/64,g/64,b/64]);
+    }, 150);
+  }catch(err){
+    console.warn(err);
+    camFallback(err && err.name==='NotAllowedError'
+      ? 'Accès à la caméra refusé. Autorise-le dans les réglages du navigateur, ou utilise le bouton ci-dessous.'
+      : 'Impossible d\'ouvrir la caméra.');
+  }
+}
+
+function camFallback(msg){
+  stopCamera();
+  const m = $('#vmsg'); if(m) m.textContent = msg;
+  const row = document.querySelector('.camrow');
+  if(row) row.innerHTML = `<button class="btn ghost" id="camBack2">Retour</button><label class="btn acc">📁 Photo / galerie<input type="file" id="cam" accept="image/*" hidden></label><button class="btn ghost" id="camRetry">↻ Caméra</button>`;
+  $('#camBack2').onclick = pRound;
+  $('#camRetry').onclick = pCamera;
   $('#cam').onchange = onPhoto;
+}
+
+function capture(v){
+  if(!v.videoWidth) return;
+  const MAX = 1400, s = Math.min(1, MAX/Math.max(v.videoWidth, v.videoHeight));
+  const w = Math.round(v.videoWidth*s), h = Math.round(v.videoHeight*s);
+  const off = document.createElement('canvas'); off.width=w; off.height=h;
+  const octx = off.getContext('2d', { willReadFrequently:true });
+  octx.drawImage(v, 0, 0, w, h);
+  stopCamera();
+  if(navigator.vibrate) navigator.vibrate(40);
+  P.off = off; P.ctx = octx;
+  P.pick = { x:Math.round(w/2), y:Math.round(h/2), rgb:null };
+  P.pick.rgb = sample(P.pick.x, P.pick.y);    // pré-sélection : le centre visé
+  pPicker();
 }
 
 function onPhoto(e){
@@ -727,16 +908,18 @@ function onPhoto(e){
 }
 
 function pPicker(){
+  P.stage = 'picker';
   const t = P.target;
   app.innerHTML = `<div class="p-wrap">${pTop()}
     <div class="cv-wrap"><canvas id="cv"></canvas></div>
     <p class="p-hint" id="phint">👆 Touche la couleur sur ta photo (tu peux glisser)</p>
     <div class="compare"><div style="background:${t.hex};color:${textOn(t.hex)}">Cible</div><div id="cmpP" class="empty-pick">Ton choix</div></div>
-    <div class="btnrow"><label class="btn ghost">↺ Reprendre${camInput('cam2')}</label><button class="btn acc" id="sendBtn" disabled>Envoyer ✓</button></div>
+    <div class="btnrow"><button class="btn ghost" id="retake">↺ Reprendre</button><button class="btn acc" id="sendBtn" disabled>Envoyer ✓</button></div>
   </div>`;
   startPTimer();
   const cv = $('#cv'); cv.width = P.off.width; cv.height = P.off.height;
   drawPicker();
+  if(P.pick) updCompare();
   const at = ev => {
     const r = cv.getBoundingClientRect();
     const x = Math.max(0,Math.min(cv.width-1, Math.round((ev.clientX-r.left)*cv.width/r.width)));
@@ -745,11 +928,11 @@ function pPicker(){
     drawPicker(); updCompare();
   };
   let down = false;
-  cv.addEventListener('pointerdown', ev => { down=true; cv.setPointerCapture(ev.pointerId); at(ev); });
+  cv.addEventListener('pointerdown', ev => { down=true; try{ cv.setPointerCapture(ev.pointerId); }catch(e){} at(ev); });
   cv.addEventListener('pointermove', ev => { if(down) at(ev); });
   cv.addEventListener('pointerup', () => down=false);
   cv.addEventListener('pointercancel', () => down=false);
-  $('#cam2').onchange = onPhoto;
+  $('#retake').onclick = pCamera;
   $('#sendBtn').onclick = sendPick;
 }
 
@@ -780,12 +963,12 @@ function updCompare(){
   const el = $('#cmpP'), hex = rgbToHex(P.pick.rgb);
   el.className=''; el.style.background = hex; el.style.color = textOn(hex);
   $('#sendBtn').disabled = false;
-  $('#phint').textContent = 'Compare, ajuste, puis envoie !';
+  $('#phint').textContent = 'Compare, ajuste au doigt, puis envoie !';
 }
 
 function sendPick(){
   if(!P.pick || P.sent) return;
-  if(!P.conn || !P.conn.open){ lost(); return; }
+  if(!P.conn || !P.conn.open){ showLost(); reconnectNow(); return; }
   const {x,y,rgb} = P.pick, W=P.off.width, Hh=P.off.height;
   const side = Math.round(Math.min(W,Hh)*0.6);
   const sx = Math.max(0,Math.min(W-side, x-side/2)), sy = Math.max(0,Math.min(Hh-side, y-side/2));
@@ -793,17 +976,20 @@ function sendPick(){
   out.getContext('2d').drawImage(P.off, sx, sy, side, side, 0, 0, 360, 360);
   const img = out.toDataURL('image/jpeg', 0.78);
   P.conn.send({ t:'submit', rgb, img, mx:(x-sx)/side, my:(y-sy)/side });
-  $('#sendBtn').disabled = true; $('#sendBtn').textContent = 'Envoi…';
+  const b = $('#sendBtn'); b.disabled = true; b.textContent = 'Envoi…';
+  // si l'accusé ne revient pas, on réactive le bouton
+  setTimeout(() => { const bb=$('#sendBtn'); if(!P.sent && bb){ bb.disabled=false; bb.textContent='Renvoyer ✓'; } }, 6000);
 }
 
 function pSent(){
+  P.stage = '';
   app.innerHTML = `<div class="p-wrap">${pTop()}<div class="p-mid"><div class="sent-check">✓</div><h2>Photo envoyée !</h2>
     <p class="p-hint">Patiente pendant que les autres cherchent…<br>Le reveal arrive sur l'écran.</p></div></div>`;
   startPTimer();
 }
 
 function pResult(d){
-  stopPTimer();
+  stopPTimer(); P.stage = '';
   if(d.none){ pWait('Pas de photo cette fois','Total : '+d.total+' pts. '+(d.last?'Regarde l\'écran pour la suite !':'Prépare-toi pour la prochaine manche.'),'😴'); return; }
   setT(d.hex);
   const msg = d.rank===1 ? (d.n>1?'Pile la bonne nuance ! 👑':'Bien vu !') : d.pct>=85 ? 'Très proche !' : d.pct>=60 ? 'Pas mal du tout' : 'Hmm… daltonien ? 😅';
@@ -817,7 +1003,7 @@ function pResult(d){
 }
 
 function pEnd(d){
-  stopPTimer(); setT(d.rank===1?'#FFC531':'#ff5a36');
+  stopPTimer(); P.stage = ''; setT(d.rank===1?'#FFC531':'#ff5a36');
   const e = d.rank===1?'🏆':d.rank===2?'🥈':d.rank===3?'🥉':'🎨';
   app.innerHTML = `<div class="p-wrap"><div class="p-mid"><div style="font-size:5rem">${e}</div>
     <h2>Tu termines ${ordinal(d.rank)}${d.n>1?' sur '+d.n:''}</h2><div class="pctbig">${d.score} pts</div>
@@ -826,9 +1012,14 @@ function pEnd(d){
 
 /* ---------- démarrage ---------- */
 (function boot(){
-  const r = new URLSearchParams(location.search).get('r');
-  if(r) playerJoin(r.toUpperCase().slice(0,4));
-  else landing();
+  const r = (new URLSearchParams(location.search).get('r')||'').toUpperCase().slice(0,4);
+  if(!r){ landing(); return; }
+  const s = readSession();
+  // page rechargée (le téléphone a fermé l'onglet) → on se reconnecte tout seul
+  if(s && s.code===r && s.name && Date.now()-s.t < 6*3600*1000){
+    P.code = r; P.name = s.name; P.auto = true;
+    connectPlayer();
+  } else playerJoin(r);
 })();
 </script>
 </body>
